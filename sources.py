@@ -32,6 +32,52 @@ FOREX_GROUPS = [
 FOREX_ALL = [s for _, _, lst in FOREX_GROUPS for s in lst]
 
 
+YAHOO_MAP = {
+    "XAU_USD": "GC=F", "XAG_USD": "SI=F", "XPT_USD": "PL=F", "XPD_USD": "PA=F", "XCU_USD": "HG=F",
+    "SPX500_USD": "ES=F", "NAS100_USD": "NQ=F", "US30_USD": "YM=F", "US2000_USD": "RTY=F",
+    "DE30_EUR": "^GDAXI", "UK100_GBP": "^FTSE", "FR40_EUR": "^FCHI", "EU50_EUR": "^STOXX50E",
+    "JP225_USD": "^N225", "HK33_HKD": "^HSI", "AU200_AUD": "^AXJO", "NL25_EUR": "^AEX",
+    "CH20_CHF": "^SSMI", "ES35_EUR": "^IBEX",
+    "WTICO_USD": "CL=F", "BCO_USD": "BZ=F", "NATGAS_USD": "NG=F",
+}
+HOUR = 3600_000
+
+
+def yahoo_ticker(instr):
+    if instr in YAHOO_MAP:
+        return YAHOO_MAP[instr]
+    a, _, b = instr.partition("_")
+    if len(a) == 3 and len(b) == 3:
+        return f"{a}{b}=X"
+    raise ValueError("Yahoo karsiligi yok: " + instr)
+
+
+def _ny_offset_ms(ts_ms):
+    from zoneinfo import ZoneInfo
+    d = datetime.fromtimestamp(ts_ms / 1000, ZoneInfo("America/New_York"))
+    return int(d.utcoffset().total_seconds() * 1000)
+
+
+def aggregate_ny(bars, dur_ms, weekly=False):
+    """1s mumlarindan OANDA tarzi (New York 17:00 hizali) 4s / 1G / 1H mumlar uret."""
+    out = {}
+    for b in bars:
+        off = _ny_offset_ms(b[0])
+        adj = b[0] + off - 17 * HOUR                      # 17:00 NY = gun baslangici
+        if weekly:
+            day = adj // 86400_000
+            start_adj = ((day + 4) // 7 * 7 - 4) * 86400_000      # Pazar baslangicli hafta
+        else:
+            start_adj = adj // dur_ms * dur_ms
+        start = start_adj + 17 * HOUR - _ny_offset_ms(start_adj + 17 * HOUR)
+        cur = out.get(start)
+        if cur is None:
+            out[start] = [start, b[1], b[2], b[3], b[4]]
+        else:
+            cur[2] = max(cur[2], b[2]); cur[3] = min(cur[3], b[3]); cur[4] = b[4]
+    return [tuple(v) for _, v in sorted(out.items())]
+
+
 def display_name(market, symbol):
     return symbol if market == "crypto" else symbol.replace("_", "")
 
@@ -89,10 +135,10 @@ class Sources:
             rows = self._get(base + "/fapi/v1/klines", {"symbol": symbol, "interval": tf, "limit": limit})
             return [(int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]))
                     for k in rows if int(k[6]) < now_ms]
+        if market == "forex" and not self.env.get("OANDA_TOKEN", ""):
+            return self._yahoo(symbol, tf, limit, now_ms)
         if market == "forex":
             tok = self.env.get("OANDA_TOKEN", "")
-            if not tok:
-                raise RuntimeError("OANDA_TOKEN tanimli degil")
             host = OANDA_HOSTS.get(self.env.get("OANDA_ENV", "practice"), OANDA_HOSTS["practice"])
             j = self._get(f"{host}/v3/instruments/{symbol}/candles",
                           {"granularity": OANDA_GRAN[tf], "count": limit, "price": "M"},
@@ -104,6 +150,40 @@ class Sources:
                     out.append((_parse_oanda_time(c["time"]), float(m["o"]), float(m["h"]), float(m["l"]), float(m["c"])))
             return out
         raise ValueError("bilinmeyen market: " + market)
+
+    def _yahoo_raw(self, ticker, interval, rng):
+        j = self._get("https://query1.finance.yahoo.com/v8/finance/chart/" + ticker,
+                      {"interval": interval, "range": rng, "includePrePost": "false"},
+                      {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"})
+        res = (j.get("chart") or {}).get("result")
+        if not res:
+            raise RuntimeError("Yahoo: veri yok " + ticker)
+        r = res[0]
+        q = r["indicators"]["quote"][0]
+        out = []
+        for i, t in enumerate(r.get("timestamp") or []):
+            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+            if None in (o, h, l, c):
+                continue
+            out.append((int(t) * 1000, float(o), float(h), float(l), float(c)))
+        return out
+
+    def _yahoo(self, instr, tf, limit, now_ms):
+        """Hesapsiz forex/metal/endeks verisi (Yahoo Finance, resmi olmayan uc nokta)."""
+        tk = yahoo_ticker(instr)
+        dur = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}[tf] * 1000
+        if tf in ("1m", "5m", "15m"):
+            bars = self._yahoo_raw(tk, tf, "5d" if tf == "1m" else "1mo")
+        elif tf == "1h":
+            bars = self._yahoo_raw(tk, "60m", "3mo")
+        elif tf == "4h":
+            bars = aggregate_ny(self._yahoo_raw(tk, "60m", "6mo"), dur)
+        elif tf == "1d":
+            bars = aggregate_ny(self._yahoo_raw(tk, "60m", "2y"), dur)
+        else:
+            bars = aggregate_ny(self._yahoo_raw(tk, "60m", "2y"), dur, weekly=True)
+        bars = [b for b in bars if b[0] + dur <= now_ms]
+        return bars[-limit:]
 
     def _okx(self):
         return str(self.env.get("CRYPTO_SOURCE", "binance")).lower() == "okx"
